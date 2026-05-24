@@ -1,15 +1,32 @@
+# Gradle files
+.gradle/
+build/
+
+# IntelliJ IDEA files
+.idea/
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+*.iws
+
+# Android Studio files
 local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+output.json
+
+# Keystore files (SENSITIVE - NEVER PUSH TO GITHUB)
+*.jks
+*.keystore
+release-keystore.jks
+
+# Google Services
+google-services.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# User-specific files
+*.orig
+*.swp
+.active

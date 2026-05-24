@@ -6,10 +6,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -32,6 +35,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
@@ -90,6 +94,7 @@ private const val KEY_SOURCES = "sources"
 private const val KEY_TAGS = "all_tags"
 private const val KEY_REFRESH_RATE = "refresh_rate"
 private const val KEY_ARCHIVES = "archives"
+private const val KEY_READ_LINKS = "read_links"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -110,6 +115,7 @@ fun MainScreen() {
     var items by remember { mutableStateOf(emptyList<FeedItem>()) }
     var sources by remember { mutableStateOf(emptyList<FeedSource>()) }
     var archivedItems by remember { mutableStateOf(emptyList<FeedItem>()) }
+    var readLinks by remember { mutableStateOf(emptySet<String>()) }
     var allTags by remember { mutableStateOf(emptyList<String>()) }
     var refreshRate by remember { mutableStateOf("Manually") }
     var selectedTag by remember { mutableStateOf("All") }
@@ -130,6 +136,141 @@ fun MainScreen() {
     val scope = rememberCoroutineScope()
     val parser = remember { FeedParser() }
     val tagListState = rememberLazyListState()
+    val tagScrollStates = remember { mutableMapOf<String, androidx.compose.foundation.lazy.LazyListState>() }
+    val feedListState = tagScrollStates.getOrPut(selectedTag) { androidx.compose.foundation.lazy.LazyListState() }
+
+    val exportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/xml")
+    ) { uri ->
+        uri?.let {
+            scope.launch {
+                try {
+                    val opmlString = StringBuilder()
+                    opmlString.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+                    opmlString.append("<opml version=\"1.0\">\n")
+                    opmlString.append("  <head><title>Feeds Export</title></head>\n")
+                    opmlString.append("  <body>\n")
+                    
+                    // Group by tags for better OPML structure
+                    val taggedSources = sources.flatMap { s -> s.tags.map { it to s } }
+                    val untaggedSources = sources.filter { it.tags.isEmpty() }
+                    
+                    allTags.forEach { tag ->
+                        opmlString.append("    <outline title=\"${escapeXml(tag)}\" text=\"${escapeXml(tag)}\">\n")
+                        sources.filter { it.tags.contains(tag) }.forEach { s ->
+                            opmlString.append("      <outline type=\"rss\" title=\"${escapeXml(s.title)}\" text=\"${escapeXml(s.title)}\" xmlUrl=\"${escapeXml(s.url)}\" />\n")
+                        }
+                        opmlString.append("    </outline>\n")
+                    }
+                    
+                    untaggedSources.forEach { s ->
+                        opmlString.append("    <outline type=\"rss\" title=\"${escapeXml(s.title)}\" text=\"${escapeXml(s.title)}\" xmlUrl=\"${escapeXml(s.url)}\" />\n")
+                    }
+                    
+                    opmlString.append("  </body>\n")
+                    opmlString.append("</opml>")
+
+                    context.contentResolver.openOutputStream(it)?.use { stream ->
+                        stream.write(opmlString.toString().toByteArray())
+                    }
+                    android.widget.Toast.makeText(context, "Export successful!", android.widget.Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    android.widget.Toast.makeText(context, "Export failed!", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    val importLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let {
+            scope.launch {
+                try {
+                    val inputStream = context.contentResolver.openInputStream(it)
+                    val content = inputStream?.bufferedReader()?.use { it.readText() } ?: ""
+                    
+                    if (content.trim().startsWith("{")) {
+                        // JSON Import (Legacy/Backup)
+                        val data = JSONObject(content)
+                        val importedTags = data.optJSONArray("tags")
+                        if (importedTags != null) {
+                            val newTags = allTags.toMutableList()
+                            for (i in 0 until importedTags.length()) {
+                                val t = importedTags.getString(i)
+                                if (!newTags.contains(t)) newTags.add(t)
+                            }
+                            allTags = newTags
+                        }
+
+                        val importedSources = data.optJSONArray("sources")
+                        if (importedSources != null) {
+                            val newSources = sources.toMutableList()
+                            for (i in 0 until importedSources.length()) {
+                                val obj = importedSources.getJSONObject(i)
+                                val url = obj.getString("url")
+                                if (newSources.none { it.url == url }) {
+                                    val tagList = mutableListOf<String>()
+                                    val tagArr = obj.optJSONArray("tags")
+                                    if (tagArr != null) {
+                                        for (j in 0 until tagArr.length()) tagList.add(tagArr.getString(j))
+                                    }
+                                    newSources.add(FeedSource(
+                                        obj.getString("title"),
+                                        url,
+                                        obj.optString("sourceLang", "auto"),
+                                        obj.optString("targetLang", "fi"),
+                                        obj.optBoolean("isTranslationEnabled", false),
+                                        tagList
+                                    ))
+                                }
+                            }
+                            sources = newSources
+                        }
+                    } else {
+                        // OPML Import (Compatibility with Feeder/Standards)
+                        val factory = org.xmlpull.v1.XmlPullParserFactory.newInstance()
+                        val parser = factory.newPullParser()
+                        parser.setInput(java.io.StringReader(content))
+                        
+                        val newSources = sources.toMutableList()
+                        val newTags = allTags.toMutableList()
+                        var currentTag: String? = null
+                        var eventType = parser.eventType
+                        
+                        while (eventType != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+                            if (eventType == org.xmlpull.v1.XmlPullParser.START_TAG && parser.name == "outline") {
+                                val xmlUrl = parser.getAttributeValue(null, "xmlUrl")
+                                val title = parser.getAttributeValue(null, "title") ?: parser.getAttributeValue(null, "text") ?: "Untitled"
+                                
+                                if (xmlUrl != null) {
+                                    if (newSources.none { it.url == xmlUrl }) {
+                                        val tagsForThis = if (currentTag != null) listOf(currentTag) else emptyList()
+                                        newSources.add(FeedSource(title, xmlUrl, tags = tagsForThis))
+                                    }
+                                } else {
+                                    // It's a category/tag
+                                    currentTag = title
+                                    if (currentTag != "All" && !newTags.contains(currentTag)) {
+                                        newTags.add(currentTag)
+                                    }
+                                }
+                            } else if (eventType == org.xmlpull.v1.XmlPullParser.END_TAG && parser.name == "outline") {
+                                // Close the current tag category if we are leaving an outline that had no xmlUrl
+                                // This is a bit simplified but works for standard OPML
+                            }
+                            eventType = parser.next()
+                        }
+                        sources = newSources
+                        allTags = newTags
+                    }
+                    android.widget.Toast.makeText(context, "Import successful!", android.widget.Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    android.widget.Toast.makeText(context, "Import failed!", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     // Load data on startup
     LaunchedEffect(Unit) {
@@ -137,6 +278,8 @@ fun MainScreen() {
         val savedSources = prefs.getString(KEY_SOURCES, null)
         val savedTags = prefs.getString(KEY_TAGS, null)
         val savedArchives = prefs.getString(KEY_ARCHIVES, null)
+        val savedRead = prefs.getStringSet(KEY_READ_LINKS, emptySet()) ?: emptySet()
+        readLinks = savedRead
         refreshRate = prefs.getString(KEY_REFRESH_RATE, "Manually") ?: "Manually"
         
         if (savedTags != null) {
@@ -198,7 +341,7 @@ fun MainScreen() {
     }
 
     // Save data when it changes
-    LaunchedEffect(sources, allTags, refreshRate, archivedItems) {
+    LaunchedEffect(sources, allTags, refreshRate, archivedItems, readLinks) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
         
         val sourceArray = JSONArray()
@@ -232,6 +375,8 @@ fun MainScreen() {
             archiveArray.put(obj)
         }
         prefs.putString(KEY_ARCHIVES, archiveArray.toString())
+        
+        prefs.putStringSet(KEY_READ_LINKS, readLinks)
         
         prefs.putString(KEY_REFRESH_RATE, refreshRate)
         
@@ -286,6 +431,8 @@ fun MainScreen() {
                                 IconButton(onClick = { 
                                     isLoading = true
                                     scope.launch {
+                                        // Reset all scroll states to top on refresh
+                                        tagScrollStates.values.forEach { it.scrollToItem(0) }
                                         refreshItems(sources, parser) { items = it; isLoading = false }
                                     }
                                 }) {
@@ -406,7 +553,14 @@ fun MainScreen() {
                 } else {
                     FeedList(
                         items = filteredItems,
-                        onItemClick = { selectedItem = it },
+                        onItemClick = { 
+                            selectedItem = it
+                            if (it.link.isNotBlank()) {
+                                readLinks = readLinks + it.link
+                            }
+                        },
+                        readLinks = readLinks,
+                        state = feedListState,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -469,38 +623,14 @@ fun MainScreen() {
                             Spacer(modifier = Modifier.height(16.dp))
                             Row(modifier = Modifier.fillMaxWidth()) {
                                 Button(
-                                    onClick = {
-                                        val exportData = JSONObject()
-                                        val sourcesArray = JSONArray()
-                                        sources.forEach { s ->
-                                            val obj = JSONObject()
-                                            obj.put("title", s.title)
-                                            obj.put("url", s.url)
-                                            obj.put("sourceLang", s.sourceLang)
-                                            obj.put("targetLang", s.targetLang)
-                                            obj.put("isTranslationEnabled", s.isTranslationEnabled)
-                                            val tagsArr = JSONArray()
-                                            s.tags.forEach { tagsArr.put(it) }
-                                            obj.put("tags", tagsArr)
-                                            sourcesArray.put(obj)
-                                        }
-                                        exportData.put("sources", sourcesArray)
-                                        val tagsArray = JSONArray()
-                                        allTags.forEach { tagsArray.put(it) }
-                                        exportData.put("tags", tagsArray)
-                                        
-                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        val clip = android.content.ClipData.newPlainText("Feeds Export", exportData.toString())
-                                        clipboard.setPrimaryClip(clip)
-                                        android.widget.Toast.makeText(context, "Exported to clipboard!", android.widget.Toast.LENGTH_SHORT).show()
-                                    },
+                                    onClick = { exportLauncher.launch("feeds_export.opml") },
                                     modifier = Modifier.weight(1f),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color.Black),
                                     shape = RectangleShape
                                 ) { Text("Export") }
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Button(
-                                    onClick = { showSettingsDialog = false; showImportDialog = true },
+                                    onClick = { importLauncher.launch(arrayOf("*/*")) },
                                     modifier = Modifier.weight(1f),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color.Black),
                                     shape = RectangleShape
@@ -557,6 +687,15 @@ fun MainScreen() {
                         allTags = allTags.filter { it != tag }
                         sources = sources.map { s -> s.copy(tags = s.tags.filter { it != tag }) }
                         if (selectedTag == tag) selectedTag = "All"
+                    },
+                    onRenameTag = { oldName, newName ->
+                        if (newName.isNotBlank() && !allTags.contains(newName)) {
+                            allTags = allTags.map { if (it == oldName) newName else it }
+                            sources = sources.map { s ->
+                                s.copy(tags = s.tags.map { if (it == oldName) newName else it })
+                            }
+                            if (selectedTag == oldName) selectedTag = newName
+                        }
                     },
                     onMoveTag = { from, to ->
                         val mutable = allTags.toMutableList()
@@ -677,6 +816,14 @@ fun scheduleRefresh(context: Context, rate: String) {
     val workManager = WorkManager.getInstance(context)
     // Always cancel periodic work as we now only support startup or manual refresh
     workManager.cancelUniqueWork("FeedRefresh")
+}
+
+fun escapeXml(s: String): String {
+    return s.replace("&", "&amp;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
 }
 
 @Composable
@@ -835,18 +982,56 @@ fun ManageFeedsDialog(
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ManageTagsDialog(
     allTags: List<String>,
     sources: List<FeedSource>,
     onAddTag: (String) -> Unit,
     onDeleteTag: (String) -> Unit,
+    onRenameTag: (String, String) -> Unit,
     onMoveTag: (Int, Int) -> Unit,
     onToggleFeedInTag: (String, FeedSource) -> Unit,
     onDone: () -> Unit
 ) {
     var newTagName by remember { mutableStateOf("") }
     var selectedTagToEdit by remember { mutableStateOf<String?>(null) }
+    var tagToRename by remember { mutableStateOf<String?>(null) }
+    var renamedTagName by remember { mutableStateOf("") }
+
+    if (tagToRename != null) {
+        AlertDialog(
+            onDismissRequest = { tagToRename = null },
+            title = { Text("Rename Tag", fontWeight = FontWeight.Bold) },
+            text = {
+                OutlinedTextField(
+                    value = renamedTagName,
+                    onValueChange = { renamedTagName = it },
+                    label = { Text("New name for $tagToRename") },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Color.Black, unfocusedBorderColor = Color.Black, cursorColor = Color.Black),
+                    shape = RectangleShape
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onRenameTag(tagToRename!!, renamedTagName)
+                        tagToRename = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black),
+                    shape = RectangleShape
+                ) { Text("RENAME") }
+            },
+            dismissButton = {
+                Button(onClick = { tagToRename = null }, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black), border = BorderStroke(1.dp, Color.Black), shape = RectangleShape) {
+                    Text("CANCEL")
+                }
+            },
+            containerColor = Color.White,
+            shape = RectangleShape
+        )
+    }
 
     AlertDialog(
         onDismissRequest = onDone,
@@ -879,7 +1064,13 @@ fun ManageTagsDialog(
                                     .fillMaxWidth()
                                     .padding(vertical = 4.dp)
                                     .border(1.dp, Color.Black)
-                                    .clickable { selectedTagToEdit = tag }
+                                    .combinedClickable(
+                                        onClick = { selectedTagToEdit = tag },
+                                        onLongClick = { 
+                                            tagToRename = tag
+                                            renamedTagName = tag
+                                        }
+                                    )
                                     .padding(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
@@ -1001,18 +1192,31 @@ fun LanguageSelector(current: String, onSelected: (String) -> Unit) {
 }
 
 @Composable
-fun FeedList(items: List<FeedItem>, onItemClick: (FeedItem) -> Unit, modifier: Modifier = Modifier) {
-    LazyColumn(modifier = modifier.padding(horizontal = 16.dp)) {
+fun FeedList(
+    items: List<FeedItem>, 
+    onItemClick: (FeedItem) -> Unit, 
+    readLinks: Set<String>,
+    state: androidx.compose.foundation.lazy.LazyListState,
+    modifier: Modifier = Modifier
+) {
+    LazyColumn(
+        state = state,
+        modifier = modifier.padding(horizontal = 16.dp)
+    ) {
         item { Spacer(modifier = Modifier.height(16.dp)) }
         items(items) { item ->
-            FeedEntry(item, onClick = { onItemClick(item) })
+            FeedEntry(
+                item = item, 
+                isRead = readLinks.contains(item.link),
+                onClick = { onItemClick(item) }
+            )
             Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }
 
 @Composable
-fun FeedEntry(item: FeedItem, onClick: () -> Unit) {
+fun FeedEntry(item: FeedItem, isRead: Boolean, onClick: () -> Unit) {
     val displayDate = remember(item.date) {
         item.parsedDate?.format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT)) ?: item.date
     }
@@ -1037,7 +1241,10 @@ fun FeedEntry(item: FeedItem, onClick: () -> Unit) {
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold
         )
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             if (displayDate.isNotBlank()) {
                 Text(
                     text = displayDate,
@@ -1053,8 +1260,17 @@ fun FeedEntry(item: FeedItem, onClick: () -> Unit) {
             Text(
                 text = sourceName,
                 style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Normal
+                fontWeight = FontWeight.Normal,
+                modifier = Modifier.weight(1f)
             )
+            if (isRead) {
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "Read",
+                    modifier = Modifier.padding(start = 8.dp),
+                    tint = Color.Black
+                )
+            }
         }
     }
 }

@@ -95,6 +95,7 @@ private const val KEY_TAGS = "all_tags"
 private const val KEY_REFRESH_RATE = "refresh_rate"
 private const val KEY_ARCHIVES = "archives"
 private const val KEY_READ_LINKS = "read_links"
+private const val KEY_LATEST_ITEMS = "latest_items"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -279,8 +280,28 @@ fun MainScreen() {
         val savedTags = prefs.getString(KEY_TAGS, null)
         val savedArchives = prefs.getString(KEY_ARCHIVES, null)
         val savedRead = prefs.getStringSet(KEY_READ_LINKS, emptySet()) ?: emptySet()
+        val savedItems = prefs.getString(KEY_LATEST_ITEMS, null)
         readLinks = savedRead
         refreshRate = prefs.getString(KEY_REFRESH_RATE, "Manually") ?: "Manually"
+        
+        if (savedItems != null) {
+            try {
+                val jsonArray = JSONArray(savedItems)
+                val loadedItems = mutableListOf<FeedItem>()
+                for (i in 0 until jsonArray.length()) {
+                    val obj = jsonArray.getJSONObject(i)
+                    loadedItems.add(FeedItem(
+                        obj.getString("title"),
+                        obj.getString("summary"),
+                        obj.getString("date"),
+                        obj.getString("sourceUrl"),
+                        obj.optString("link", ""),
+                        if (obj.has("fullContent")) obj.getString("fullContent") else null
+                    ))
+                }
+                items = loadedItems
+            } catch (e: Exception) { e.printStackTrace() }
+        }
         
         if (savedTags != null) {
             val tagArray = JSONArray(savedTags)
@@ -341,7 +362,7 @@ fun MainScreen() {
     }
 
     // Save data when it changes
-    LaunchedEffect(sources, allTags, refreshRate, archivedItems, readLinks) {
+    LaunchedEffect(sources, allTags, refreshRate, archivedItems, readLinks, items) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
         
         val sourceArray = JSONArray()
@@ -375,6 +396,19 @@ fun MainScreen() {
             archiveArray.put(obj)
         }
         prefs.putString(KEY_ARCHIVES, archiveArray.toString())
+        
+        val itemsArray = JSONArray()
+        items.forEach { i ->
+            val obj = JSONObject()
+            obj.put("title", i.title)
+            obj.put("summary", i.summary)
+            obj.put("date", i.date)
+            obj.put("sourceUrl", i.sourceUrl)
+            obj.put("link", i.link)
+            if (i.fullContent != null) obj.put("fullContent", i.fullContent)
+            itemsArray.put(obj)
+        }
+        prefs.putString(KEY_LATEST_ITEMS, itemsArray.toString())
         
         prefs.putStringSet(KEY_READ_LINKS, readLinks)
         
@@ -546,7 +580,13 @@ fun MainScreen() {
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = if (showArchives) "No archived articles." else if (items.isEmpty()) "No feeds. Press + to add." else "No feeds for this tag.", 
+                            text = if (showArchives) {
+                                "No archived articles."
+                            } else if (sources.isEmpty()) {
+                                "No feeds. Press + to add."
+                            } else {
+                                "Press refresh to get more feeds."
+                            },
                             style = MaterialTheme.typography.bodyLarge
                         )
                     }

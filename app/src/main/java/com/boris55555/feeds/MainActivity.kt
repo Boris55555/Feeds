@@ -82,6 +82,10 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.boris55555.feeds.ui.theme.FeedsTheme
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.format.DateTimeFormatter
@@ -363,59 +367,59 @@ fun MainScreen() {
 
     // Save data when it changes
     LaunchedEffect(sources, allTags, refreshRate, archivedItems, readLinks, items) {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-        
-        val sourceArray = JSONArray()
-        sources.forEach { s ->
-            val obj = JSONObject()
-            obj.put("title", s.title)
-            obj.put("url", s.url)
-            obj.put("sourceLang", s.sourceLang)
-            obj.put("targetLang", s.targetLang)
-            obj.put("isTranslationEnabled", s.isTranslationEnabled)
+        withContext(Dispatchers.Default) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            
+            val sourceArray = JSONArray()
+            sources.forEach { s ->
+                val obj = JSONObject()
+                obj.put("title", s.title)
+                obj.put("url", s.url)
+                obj.put("sourceLang", s.sourceLang)
+                obj.put("targetLang", s.targetLang)
+                obj.put("isTranslationEnabled", s.isTranslationEnabled)
+                val tagArray = JSONArray()
+                s.tags.forEach { tagArray.put(it) }
+                obj.put("tags", tagArray)
+                sourceArray.put(obj)
+            }
+            prefs.putString(KEY_SOURCES, sourceArray.toString())
+            
             val tagArray = JSONArray()
-            s.tags.forEach { tagArray.put(it) }
-            obj.put("tags", tagArray)
-            sourceArray.put(obj)
+            allTags.forEach { tagArray.put(it) }
+            prefs.putString(KEY_TAGS, tagArray.toString())
+            
+            val archiveArray = JSONArray()
+            archivedItems.forEach { i ->
+                val obj = JSONObject()
+                obj.put("title", i.title)
+                obj.put("summary", i.summary)
+                obj.put("date", i.date)
+                obj.put("sourceUrl", i.sourceUrl)
+                obj.put("link", i.link)
+                if (i.fullContent != null) obj.put("fullContent", i.fullContent)
+                archiveArray.put(obj)
+            }
+            prefs.putString(KEY_ARCHIVES, archiveArray.toString())
+            
+            val itemsArray = JSONArray()
+            items.forEach { i ->
+                val obj = JSONObject()
+                obj.put("title", i.title)
+                obj.put("summary", i.summary)
+                obj.put("date", i.date)
+                obj.put("sourceUrl", i.sourceUrl)
+                obj.put("link", i.link)
+                if (i.fullContent != null) obj.put("fullContent", i.fullContent)
+                itemsArray.put(obj)
+            }
+            prefs.putString(KEY_LATEST_ITEMS, itemsArray.toString())
+            
+            prefs.putStringSet(KEY_READ_LINKS, readLinks)
+            prefs.putString(KEY_REFRESH_RATE, refreshRate)
+            
+            prefs.apply()
         }
-        prefs.putString(KEY_SOURCES, sourceArray.toString())
-        
-        val tagArray = JSONArray()
-        allTags.forEach { tagArray.put(it) }
-        prefs.putString(KEY_TAGS, tagArray.toString())
-        
-        val archiveArray = JSONArray()
-        archivedItems.forEach { i ->
-            val obj = JSONObject()
-            obj.put("title", i.title)
-            obj.put("summary", i.summary)
-            obj.put("date", i.date)
-            obj.put("sourceUrl", i.sourceUrl)
-            obj.put("link", i.link)
-            if (i.fullContent != null) obj.put("fullContent", i.fullContent)
-            archiveArray.put(obj)
-        }
-        prefs.putString(KEY_ARCHIVES, archiveArray.toString())
-        
-        val itemsArray = JSONArray()
-        items.forEach { i ->
-            val obj = JSONObject()
-            obj.put("title", i.title)
-            obj.put("summary", i.summary)
-            obj.put("date", i.date)
-            obj.put("sourceUrl", i.sourceUrl)
-            obj.put("link", i.link)
-            if (i.fullContent != null) obj.put("fullContent", i.fullContent)
-            itemsArray.put(obj)
-        }
-        prefs.putString(KEY_LATEST_ITEMS, itemsArray.toString())
-        
-        prefs.putStringSet(KEY_READ_LINKS, readLinks)
-        
-        prefs.putString(KEY_REFRESH_RATE, refreshRate)
-        
-        prefs.apply()
-        
         scheduleRefresh(context, refreshRate)
     }
 
@@ -835,21 +839,27 @@ fun MainScreen() {
     }
 }
 
-suspend fun refreshItems(sources: List<FeedSource>, parser: FeedParser, onUpdate: (List<FeedItem>) -> Unit) {
-    val allItems = mutableListOf<FeedItem>()
-    sources.forEach { s ->
-        val (_, fetched) = parser.fetchFeedItems(s.url)
-        val limited = fetched.take(10)
-        if (s.isTranslationEnabled && s.sourceLang != s.targetLang) {
-            limited.forEach { item ->
-                val translatedTitle = parser.translate(item.title, s.sourceLang, s.targetLang)
-                allItems.add(item.copy(title = translatedTitle))
+suspend fun refreshItems(sources: List<FeedSource>, parser: FeedParser, onUpdate: (List<FeedItem>) -> Unit) = withContext(Dispatchers.IO) {
+    val allItems = sources.map { s ->
+        async {
+            val (_, fetched) = parser.fetchFeedItems(s.url)
+            val limited = fetched.take(10)
+            if (s.isTranslationEnabled && s.sourceLang != s.targetLang) {
+                limited.map { item ->
+                    async {
+                        val translatedTitle = parser.translate(item.title, s.sourceLang, s.targetLang)
+                        item.copy(title = translatedTitle)
+                    }
+                }.awaitAll()
+            } else {
+                limited
             }
-        } else {
-            allItems.addAll(limited)
         }
+    }.awaitAll().flatten()
+    
+    withContext(Dispatchers.Main) {
+        onUpdate(allItems.distinctBy { it.title }.sortedByDescending { it.parsedDate })
     }
-    onUpdate(allItems.distinctBy { it.title }.sortedByDescending { it.parsedDate })
 }
 
 fun scheduleRefresh(context: Context, rate: String) {
